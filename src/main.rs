@@ -1,4 +1,6 @@
-use std::f32;
+use anyhow::{Context, Result};
+use std::path::Path;
+use std::{env, f32, vec};
 
 fn get_pitch_acf(frame_data: &[f32], sample_rate: f32, min_f0: f32, max_f0: f32) -> Option<f32> {
     let frame_size = frame_data.len();
@@ -19,7 +21,7 @@ fn get_pitch_acf(frame_data: &[f32], sample_rate: f32, min_f0: f32, max_f0: f32)
     for k in 1..=max_lag {
         let mut sum = 0.0;
         if k > min_lag {
-            for j in 0..(frame_size - 1 - k) {
+            for j in 0..(frame_size - k) {
                 sum += frame_data[j] * frame_data[j + k];
             }
         }
@@ -53,25 +55,122 @@ fn get_pitch_acf(frame_data: &[f32], sample_rate: f32, min_f0: f32, max_f0: f32)
         None
     }
 }
-fn main() {
-    let sample_rate = 44100.0;
-    let f0_hz = 220.0;
-    let duration_sec = 0.05;
-    let frame_size = (sample_rate * duration_sec) as usize;
 
-    // simple sin wave
-    let mut test_frame = vec![0.0; frame_size];
-    for i in 0..frame_size {
-        test_frame[i] = (2.0 * f32::consts::PI * f0_hz * (i as f32 / sample_rate as f32)).sin();
+fn load_wav_to_f32(path: &Path) -> Result<(Vec<f32>, hound::WavSpec)> {
+    let mut reader = hound::WavReader::open(path)
+        .with_context(|| format!("Failed to open WAV file: {:?}", path))?;
+    let spec = reader.spec();
+
+    if spec.channels != 1 {
+        anyhow::bail!(
+            "Only mono WAV files are supported. This file has {} channels.",
+            spec.channels
+        );
     }
 
-    let min_f0_search = 70.0;
-    let max_f0_search = 500.0;
+    let samples: Result<Vec<_>, _> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().collect(),
+        hound::SampleFormat::Int => {
+            match spec.bits_per_sample {
+                16 => reader
+                    .samples::<i16>()
+                    .map(|s| s.map(|x| x as f32 / 32768.0))
+                    .collect(),
+                24 => reader
+                    .samples::<i32>() // houndはi24をi32として読む
+                    .map(|s| s.map(|x| (x >> 8) as f32 / 8388608.0)) // i24 -> f32 normalized
+                    .collect(),
+                32 => reader // i32 の場合
+                    .samples::<i32>()
+                    .map(|s| s.map(|x| x as f32 / 2147483648.0))
+                    .collect(),
+                _ => anyhow::bail!(
+                    "Unsupported bit depth: {} bits per sample for Int format",
+                    spec.bits_per_sample
+                ),
+            }
+        }
+    };
 
-    if let Some(detected_f0) = get_pitch_acf(&test_frame, sample_rate, min_f0_search, max_f0_search)
-    {
-        println!("Detected F0: {:.2} Hz", detected_f0)
-    } else {
-        println!("Pitch not detected");
+    samples
+        .map(|s| (s, spec))
+        .with_context(|| format!("Fasiled to read samples from WAV file"))
+}
+
+fn apply_hanning_window(frame: &[f32]) -> Vec<f32> {
+    let frame_len = frame.len();
+    if frame_len == 0 {
+        return Vec::new();
     }
+    let mut windowed_frame = Vec::with_capacity(frame_len);
+    for i in 0..frame_len {
+        let multiplier =
+            0.5 * (1.0 - (2.0 * std::f32::consts::PI * (i as f32) / (frame_len - 1) as f32).cos());
+        windowed_frame.push(frame[i] * multiplier);
+    }
+    windowed_frame
+}
+fn main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: {} <path_to_wav_file", args[0]);
+        std::process::exit(1);
+    }
+    let wav_path = Path::new(&args[1]);
+
+    // Parameters
+    let frame_duration_ms = 30.0;
+    let hop_duration_ms = 10.0;
+    let min_f0_hz = 80.0;
+    let max_f0_hz = 1000.0;
+
+    // Read wav file
+    let (audio_data, spec) = load_wav_to_f32(wav_path)?;
+    let sample_rate = spec.sample_rate as f32;
+
+    println!(
+        "Loaded WAV: {:?}, Sample Rate: {} Hz, Duration: {:.2}s",
+        wav_path.file_name().unwrap_or_default(),
+        sample_rate,
+        audio_data.len() as f32 / sample_rate
+    );
+    let frame_size_samples = (sample_rate * frame_duration_ms / 1000.0).round() as usize;
+    let hop_size_samples = (sample_rate * hop_duration_ms / 1000.0).round() as usize;
+
+    if frame_size_samples == 0 || hop_size_samples == 0 {
+        anyhow::bail!("Frame size or hop size is too small for the given sample rate.");
+    }
+    println!(
+        "Frame size: {} samples ({:.1} ms)",
+        frame_size_samples, frame_duration_ms
+    );
+    println!(
+        "Hop size: {} samples ({:.1} ms)",
+        hop_size_samples, hop_duration_ms
+    );
+    println!("--------------------------------------------------");
+    println!("Time (s)\tDetected F0 (Hz)");
+    println!("--------------------------------------------------");
+
+    // --- フレーム処理とピッチ検出 ---
+    let mut current_pos = 0;
+    while current_pos + frame_size_samples <= audio_data.len() {
+        let frame = &audio_data[current_pos..current_pos + frame_size_samples];
+
+        let windowed_frame = apply_hanning_window(frame);
+        let detected_f0 = get_pitch_acf(&windowed_frame, sample_rate, min_f0_hz, max_f0_hz);
+
+        let time_sec = current_pos as f32 / sample_rate;
+
+        match detected_f0 {
+            Some(f0) => println!("{:.3}\t\t{:.2}", time_sec, f0),
+            None => println!("{:.3}\t\t-- (Unvoiced/Silent)", time_sec),
+        }
+
+        current_pos += hop_size_samples;
+    }
+    println!("--------------------------------------------------");
+    println!("Processing finished.");
+
+    Ok(())
 }
